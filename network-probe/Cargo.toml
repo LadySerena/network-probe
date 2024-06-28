@@ -11,7 +11,7 @@ path = "src/main.rs"
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
 
 [dependencies]
-anyhow = "1.0.86"
+anyhow = { version = "1.0.86", features = ["backtrace"] }
 k8s-cri = "0.8.0"
 libbpf-rs = "0.23.3"
 libc = "0.2.155"

@@ -1,8 +1,10 @@
 #![deny(clippy::correctness)]
+#![warn(clippy::unwrap_used)]
 #![deny(deprecated)]
 #![warn(clippy::perf)]
 
 use anyhow::bail;
+use anyhow::Error;
 use egress::egress_types::event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
@@ -26,26 +28,68 @@ use egress::*;
 use libbpf_rs::RingBufferBuilder;
 use plain::Plain;
 
-async fn post_process(event: event) -> (String, String) {
+async fn post_process(event: event) -> Result<(String, String)> {
+    // TODO make this configurable
     let path = "/run/containerd/containerd.sock";
-    let channel = Endpoint::try_from("http://[::]")
-        .unwrap()
+    let channel = Endpoint::try_from("http://[::]")?
         .connect_with_connector(service_fn(move |_: Uri| UnixStream::connect(path)))
-        .await
-        .unwrap();
+        .await?;
     let mut client = RuntimeServiceClient::new(channel);
     let cgroup_path = get_cgroup_path_from_pid(event.pid);
-    let container_id = cgroup_path.split('/').last().unwrap().to_string();
+    let container_id: String = {
+        let this = cgroup_path.split('/').last();
+        match this {
+            Some(val) => val,
+            None => {
+                return Err(Error::msg(format!(
+                    "failed to find container_id from cgroup: {cgroup_path}"
+                )));
+            }
+        }
+    }
+    .to_string();
 
     let request = ContainerStatusRequest {
-        container_id,
+        container_id: container_id.clone(),
         verbose: true,
     };
-    let response = client.container_status(request).await.unwrap().into_inner();
-    let status = response.status.unwrap().labels;
-    let pod_name = status.get("io.kubernetes.pod.name").unwrap();
-    let namespace = status.get("io.kubernetes.pod.namespace").unwrap();
-    (pod_name.to_string(), namespace.to_string())
+    let response = client.container_status(request).await?.into_inner();
+    let status = {
+        let this = response.status;
+        match this {
+            Some(val) => val,
+            None => {
+                return Err(Error::msg(format!(
+                    "could not retrieve pod status from {}",
+                    container_id.clone()
+                )));
+            }
+        }
+    }
+    .labels;
+    let pod_name = {
+        let this = status.get("io.kubernetes.pod.name");
+        match this {
+            Some(val) => val,
+            None => {
+                return Err(Error::msg(format!(
+                    "could not retrive pod name from metadata for container: {container_id}"
+                )))
+            }
+        }
+    };
+    let namespace = {
+        let this = status.get("io.kubernetes.pod.namespace");
+        match this {
+            Some(val) => val,
+            None => {
+                return Err(Error::msg(format!(
+                    "could not retrieve pod namespace for pod: {pod_name}"
+                )))
+            }
+        }
+    };
+    Ok((pod_name.to_string(), namespace.to_string()))
 }
 
 // upstream uses this to bump memory limits for the probes
@@ -94,7 +138,7 @@ fn main() {
         let event = measure_egress(data);
         let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
         let handle = runtime.spawn(post_process(event));
-        let info = runtime.block_on(handle).unwrap();
+        let info = runtime.block_on(handle).unwrap().unwrap();
         println!(
             "pod: {0}, namespace: {1}, bytes: {2}",
             info.0, info.1, event.packet_length
