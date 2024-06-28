@@ -35,7 +35,7 @@ async fn post_process(event: event) -> Result<(String, String)> {
         .connect_with_connector(service_fn(move |_: Uri| UnixStream::connect(path)))
         .await?;
     let mut client = RuntimeServiceClient::new(channel);
-    let cgroup_path = get_cgroup_path_from_pid(event.pid);
+    let cgroup_path = get_cgroup_path_from_pid(event.pid)?;
     let container_id: String = {
         let this = cgroup_path.split('/').last();
         match this {
@@ -106,12 +106,18 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
-fn get_cgroup_path_from_pid(pid: i32) -> String {
-    let proc_info = procfs::process::Process::new(pid).unwrap();
+fn get_cgroup_path_from_pid(pid: i32) -> Result<String> {
+    let proc_info = procfs::process::Process::new(pid)?;
     // This is for systems with cgroup v2 so we can assume process and cgroup is 1:1
-    let binding = proc_info.cgroups().unwrap();
-    let cgroups = binding.0.first().unwrap();
-    cgroups.pathname.clone()
+    let binding = proc_info.cgroups()?;
+    let cgroups = {
+        let this = binding.0.first();
+        match this {
+            Some(val) => val,
+            None => return Err(Error::msg(format!("could not find cgroup for pid: {pid}"))),
+        }
+    };
+    Ok(cgroups.pathname.clone())
 }
 
 fn measure_egress(data: &[u8]) -> event {
@@ -127,18 +133,42 @@ fn measure_egress(data: &[u8]) -> event {
 fn main() {
     let skeleton_builder = EgressSkelBuilder::default();
 
-    bump_memlock_rlimit().unwrap();
-    let open_skeleton = skeleton_builder.open().unwrap();
-    let mut skeleton = open_skeleton.load().unwrap();
-    skeleton.attach().unwrap();
+    {
+        let this = bump_memlock_rlimit();
+        match this {
+            Ok(t) => t,
+            Err(e) => {
+                println!("{e}");
+                println!("couldn't increase memory limit, no exiting");
+                return;
+            }
+        }
+    };
+    let open_skeleton = skeleton_builder.open().expect("couldn't open skeleton");
+    let mut skeleton = open_skeleton.load().expect("couldn't load from skeleton");
+    skeleton.attach().expect("couldn't attach ebpf program");
 
     let mut ring_buffer_builder = RingBufferBuilder::new();
     let mut skeleton_maps = skeleton.maps_mut();
     let ring_buffer_callback = |data: &[u8]| -> i32 {
         let event = measure_egress(data);
-        let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+        let runtime = Builder::new_multi_thread()
+            .enable_all()
+            .build()
+            .expect("couldn't build tokio runtime");
         let handle = runtime.spawn(post_process(event));
-        let info = runtime.block_on(handle).unwrap().unwrap();
+        let info = {
+            let this = runtime
+                .block_on(handle)
+                .expect("error occurred during runtime blocking");
+            match this {
+                Ok(t) => t,
+                Err(e) => {
+                    println!("{e}");
+                    return 0;
+                }
+            }
+        };
         println!(
             "pod: {0}, namespace: {1}, bytes: {2}",
             info.0, info.1, event.packet_length
@@ -148,23 +178,49 @@ fn main() {
 
     ring_buffer_builder
         .add(skeleton_maps.rb(), ring_buffer_callback)
-        .unwrap();
-    let ring_buffer = ring_buffer_builder.build().unwrap();
+        .expect("couldn't add callback to ring buffer");
+    let ring_buffer = ring_buffer_builder
+        .build()
+        .expect("couldn't build ring buffer");
     println!("starting");
 
-    let f = std::fs::OpenOptions::new()
-        .read(true)
-        .write(false)
-        .open("/sys/fs/cgroup/kubepods/")
-        .unwrap();
+    let f = {
+        let this = std::fs::OpenOptions::new()
+            .read(true)
+            .write(false)
+            .open("/sys/fs/cgroup/kubepods/");
+        match this {
+            Ok(t) => t,
+            Err(e) => {
+                println!("{e}");
+                println!("exiting due to missing cgroup hierarchy");
+                return;
+            }
+        }
+    };
 
     let cgroup_fd = f.as_raw_fd();
-    let _bpf_sockops = skeleton
-        .progs_mut()
-        .measure_packet_len()
-        .attach_cgroup(cgroup_fd)
-        .unwrap();
+    let _bpf_sockops = {
+        let this = skeleton
+            .progs_mut()
+            .measure_packet_len()
+            .attach_cgroup(cgroup_fd);
+        match this {
+            Ok(t) => t,
+            Err(e) => {
+                println!("{e}");
+                println!("exiting due to failed attachment to cgroup");
+                return;
+            }
+        }
+    };
     loop {
-        ring_buffer.poll(Duration::from_millis(100)).unwrap();
+        {
+            let this = ring_buffer.poll(Duration::from_millis(100));
+            match this {
+                Ok(t) => t,
+                Err(e) => println!("{e}"),
+            }
+        };
     }
 }
