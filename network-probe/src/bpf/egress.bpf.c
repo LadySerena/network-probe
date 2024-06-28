@@ -18,6 +18,13 @@ int measure_packet_len(struct __sk_buff *skb) {
   struct task_struct *task;
   task = (struct task_struct *)bpf_get_current_task();
   struct event *e;
+  __u64 cgroup_id = bpf_skb_cgroup_id(skb);
+  // TODO make ancestor configurable via maps
+  __u64 cgroup_ancestor_id = bpf_skb_ancestor_cgroup_id(skb, 6);
+  pid_t pid = BPF_CORE_READ(task, pid);
+  if (pid == 0) {
+    return 1;
+  }
 
   e = bpf_ringbuf_reserve(&rb, sizeof(*e), 0);
   // bail because no space
@@ -25,8 +32,10 @@ int measure_packet_len(struct __sk_buff *skb) {
     return 1;
   }
   e->pid = BPF_CORE_READ(task, pid);
-  e->ppid = BPF_CORE_READ(task, real_parent, pid);
-  e->cgroup = bpf_get_current_cgroup_id();
+  e->ppid = BPF_CORE_READ(task, parent, pid);
+  e->real_ppid = BPF_CORE_READ(task, group_leader, pid);
+  e->cgroup = cgroup_id;
+  e->cgroup_ancestor = cgroup_ancestor_id;
   e->packet_length = skb->len;
 
   bpf_ringbuf_submit(e, 0);

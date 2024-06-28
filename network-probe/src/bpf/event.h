@@ -6,6 +6,8 @@
 struct event {
   int pid;
   int ppid;
+  int real_ppid;
+  unsigned long long cgroup_ancestor;
   unsigned long long cgroup;
   unsigned int packet_length;
 };

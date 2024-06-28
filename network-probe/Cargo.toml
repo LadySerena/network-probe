@@ -1,0 +1,25 @@
+[package]
+name = "network-probe"
+version = "0.1.0"
+edition = "2021"
+license = "GPL-2.0-only or MPL-2.0"
+
+[[bin]]
+name = "network-probe"
+path = "src/main.rs"
+
+# See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html
+
+[dependencies]
+anyhow = "1.0.86"
+k8s-cri = "0.8.0"
+libbpf-rs = "0.23.3"
+libc = "0.2.155"
+plain = "0.2.3"
+procfs = "0.16.0"
+tokio = { version = "1.38.0", features = ["full"] }
+tonic = "0.11.0"
+tower = "0.4.13"
+
+[build-dependencies]
+libbpf-cargo = "0.23.3"
