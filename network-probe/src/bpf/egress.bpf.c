@@ -7,6 +7,8 @@ char LICENSE[] SEC("license") = "Dual MPL/GPL";
 
 struct event _event = {0};
 
+const volatile int ancestor_level = 0;
+
 struct {
   __uint(type, BPF_MAP_TYPE_RINGBUF);
   __uint(max_entries, 256 * 1024);
@@ -20,7 +22,7 @@ int measure_packet_len(struct __sk_buff *skb) {
   struct event *e;
   __u64 cgroup_id = bpf_skb_cgroup_id(skb);
   // TODO make ancestor configurable via maps
-  __u64 cgroup_ancestor_id = bpf_skb_ancestor_cgroup_id(skb, 6);
+  __u64 cgroup_ancestor_id = bpf_skb_ancestor_cgroup_id(skb, ancestor_level);
   pid_t pid = BPF_CORE_READ(task, pid);
   if (pid == 0) {
     return 1;

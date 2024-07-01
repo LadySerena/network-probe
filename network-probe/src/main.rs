@@ -1,14 +1,19 @@
 #![deny(clippy::correctness)]
-#![warn(clippy::unwrap_used)]
+#![warn(clippy::style)]
+#![warn(clippy::complexity)]
+#![warn(clippy::suspicious)]
 #![deny(deprecated)]
 #![warn(clippy::perf)]
 
 use anyhow::bail;
 use anyhow::Error;
+use clap::Parser;
 use egress::egress_types::event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
+use regex::Regex;
 use std::os::fd::AsRawFd;
+use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
@@ -28,11 +33,23 @@ use egress::*;
 use libbpf_rs::RingBufferBuilder;
 use plain::Plain;
 
-async fn post_process(event: event) -> Result<(String, String)> {
-    // TODO make this configurable
-    let path = "/run/containerd/containerd.sock";
+#[derive(Debug, Parser)]
+struct Cli {
+    #[arg(short, long)]
+    ancestor_level: i32,
+    #[arg(short = 'c', long)]
+    cri_socket: PathBuf,
+    #[arg(short = 'g', long)]
+    cgroup_path: PathBuf,
+}
+
+async fn post_process(cri_socket_path: PathBuf, event: event) -> Result<(String, String)> {
+    let re = Regex::new(r"(cri-containerd-)?([^\.]+)")?;
+    // TODO pass this in instead of creating a connection for every event
     let channel = Endpoint::try_from("http://[::]")?
-        .connect_with_connector(service_fn(move |_: Uri| UnixStream::connect(path)))
+        .connect_with_connector(service_fn(move |_: Uri| {
+            UnixStream::connect(cri_socket_path.clone())
+        }))
         .await?;
     let mut client = RuntimeServiceClient::new(channel);
     let cgroup_path = get_cgroup_path_from_pid(event.pid)?;
@@ -48,9 +65,22 @@ async fn post_process(event: event) -> Result<(String, String)> {
         }
     }
     .to_string();
-
+    let clean_id = {
+        let this = {
+            let this = re.captures(&container_id);
+            match this {
+                Some(val) => val,
+                None => return Err(Error::msg("regex failed match")),
+            }
+        }
+        .get(2);
+        match this {
+            Some(val) => val,
+            None => return Err(Error::msg("not found in 1")),
+        }
+    };
     let request = ContainerStatusRequest {
-        container_id: container_id.clone(),
+        container_id: clean_id.as_str().to_string(),
         verbose: true,
     };
     let response = client.container_status(request).await?.into_inner();
@@ -123,14 +153,11 @@ fn get_cgroup_path_from_pid(pid: i32) -> Result<String> {
 fn measure_egress(data: &[u8]) -> event {
     let mut event = egress_types::event::default();
     plain::copy_from_bytes(&mut event, data).expect("data buffer too short");
-    // TODO get container name from event
-    // let cgroup_path = get_cgroup_path_from_pid(event.pid);
-    // // TODO configurable cri endpoint
-    // let container_path = "/run/containerd/containerd.sock";
     event
 }
 
 fn main() {
+    let opts = Cli::parse();
     let skeleton_builder = EgressSkelBuilder::default();
 
     {
@@ -144,7 +171,10 @@ fn main() {
             }
         }
     };
-    let open_skeleton = skeleton_builder.open().expect("couldn't open skeleton");
+    let mut open_skeleton = skeleton_builder.open().expect("couldn't open skeleton");
+
+    open_skeleton.rodata_mut().ancestor_level = opts.ancestor_level;
+
     let mut skeleton = open_skeleton.load().expect("couldn't load from skeleton");
     skeleton.attach().expect("couldn't attach ebpf program");
 
@@ -156,7 +186,8 @@ fn main() {
             .enable_all()
             .build()
             .expect("couldn't build tokio runtime");
-        let handle = runtime.spawn(post_process(event));
+        let cri_socket_path = opts.cri_socket.clone();
+        let handle = runtime.spawn(post_process(cri_socket_path, event));
         let info = {
             let this = runtime
                 .block_on(handle)
@@ -188,7 +219,7 @@ fn main() {
         let this = std::fs::OpenOptions::new()
             .read(true)
             .write(false)
-            .open("/sys/fs/cgroup/kubepods/");
+            .open(opts.cgroup_path);
         match this {
             Ok(t) => t,
             Err(e) => {
