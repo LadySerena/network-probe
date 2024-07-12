@@ -1,8 +1,8 @@
-FROM rust:1 as build-env
+FROM rust:1 AS build-env
 WORKDIR /app
 COPY . /app/
 RUN cargo build --release --bin "client"
 
 FROM gcr.io/distroless/cc-debian12
 COPY --from=build-env /app/target/release/client /
-CMD ["./client"]
+CMD ["/client"]

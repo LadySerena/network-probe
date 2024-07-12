@@ -1,1 +1,4 @@
 /target
+Dockerfile
+kubernetes/
+vmlinux.h

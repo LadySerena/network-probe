@@ -1,0 +1,10 @@
+kind: Cluster
+apiVersion: kind.x-k8s.io/v1alpha4
+nodes:
+- role: control-plane
+  # mount procfs from the host into kind node
+  # kind runs within it's own pid namespace but ebpf runs in the host namespace
+  # on regular kubernetes clusters you don't have a nested pid namespace
+  extraMounts:
+  - hostPath: /proc
+    containerPath: /system-proc

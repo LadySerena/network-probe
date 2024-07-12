@@ -1,0 +1,57 @@
+apiVersion: apps/v1
+kind: DaemonSet
+metadata:
+  name: network-probe
+  namespace: kube-system
+  labels:
+    app: network-probe
+    role: probe
+spec:
+  updateStrategy:
+    type: RollingUpdate
+    rollingUpdate:
+      maxSurge: 2
+      maxUnavailable: 0
+  selector:
+    matchLabels:
+      app: network-probe
+      role: probe
+  template:
+    metadata:
+      labels:
+        app: network-probe
+        role: probe
+    spec:
+      volumes:
+        - name: sysfs
+          hostPath:
+            path: /sys/fs/cgroup/kubelet.slice/kubelet-kubepods.slice
+            type: Directory
+        - name: containerd-socket
+          hostPath:
+            path: /run/containerd/containerd.sock
+            type: Socket
+        - name: proc
+          hostPath:
+            path: /system-proc
+            type: Directory
+      containers:
+        - name: probe
+          image: network-probe:demo
+          imagePullPolicy: Never
+          securityContext:
+            privileged: true
+          args:
+            - --ancestor-level=1
+            - --cri-socket=/host/containerd.sock
+            - --cgroup-path=/host/sys/
+            - --proc-fs-path=/host/proc
+          volumeMounts:
+            - name: sysfs
+              mountPath: /host/sys
+              readOnly: true
+            - name: containerd-socket
+              mountPath: /host/containerd.sock
+            - name: proc
+              mountPath: /host/proc
+              readOnly: true

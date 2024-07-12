@@ -11,6 +11,9 @@ use clap::Parser;
 use egress::egress_types::event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
+use libbpf_rs::skel::OpenSkel;
+use libbpf_rs::skel::Skel;
+use libbpf_rs::skel::SkelBuilder;
 use regex::Regex;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
@@ -20,10 +23,6 @@ use tokio::runtime::Builder;
 use tonic::transport::Endpoint;
 use tonic::transport::Uri;
 use tower::service_fn;
-
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 mod egress {
     include!(concat!(env!("OUT_DIR"), "/egress.skel.rs"));
 }
@@ -41,9 +40,15 @@ struct Cli {
     cri_socket: PathBuf,
     #[arg(short = 'g', long)]
     cgroup_path: PathBuf,
+    #[arg(short = 'p', long)]
+    proc_fs_path: PathBuf,
 }
 
-async fn post_process(cri_socket_path: PathBuf, event: event) -> Result<(String, String)> {
+async fn post_process(
+    cri_socket_path: PathBuf,
+    proc_path: PathBuf,
+    event: event,
+) -> Result<(String, String)> {
     let re = Regex::new(r"(cri-containerd-)?([^\.]+)")?;
     // TODO pass this in instead of creating a connection for every event
     let channel = Endpoint::try_from("http://[::]")?
@@ -52,7 +57,7 @@ async fn post_process(cri_socket_path: PathBuf, event: event) -> Result<(String,
         }))
         .await?;
     let mut client = RuntimeServiceClient::new(channel);
-    let cgroup_path = get_cgroup_path_from_pid(event.pid)?;
+    let cgroup_path = get_cgroup_path_from_pid(proc_path, event.pid).await?;
     let container_id: String = {
         let this = cgroup_path.split('/').last();
         match this {
@@ -136,8 +141,14 @@ fn bump_memlock_rlimit() -> Result<()> {
     Ok(())
 }
 
-fn get_cgroup_path_from_pid(pid: i32) -> Result<String> {
-    let proc_info = procfs::process::Process::new(pid)?;
+async fn get_cgroup_path_from_pid(proc_path: PathBuf, pid: i32) -> Result<String> {
+    let proc_info = match procfs::process::Process::new_with_root(proc_path.join(pid.to_string())) {
+        Ok(it) => it,
+        Err(err) => {
+            return Err(err.into());
+        }
+    };
+
     // This is for systems with cgroup v2 so we can assume process and cgroup is 1:1
     let binding = proc_info.cgroups()?;
     let cgroups = {
@@ -172,22 +183,21 @@ fn main() {
         }
     };
     let mut open_skeleton = skeleton_builder.open().expect("couldn't open skeleton");
-
     open_skeleton.rodata_mut().ancestor_level = opts.ancestor_level;
 
     let mut skeleton = open_skeleton.load().expect("couldn't load from skeleton");
     skeleton.attach().expect("couldn't attach ebpf program");
-
+    let runtime = Builder::new_multi_thread()
+        .enable_all()
+        .build()
+        .expect("couldn't build tokio runtime");
     let mut ring_buffer_builder = RingBufferBuilder::new();
     let mut skeleton_maps = skeleton.maps_mut();
     let ring_buffer_callback = |data: &[u8]| -> i32 {
         let event = measure_egress(data);
-        let runtime = Builder::new_multi_thread()
-            .enable_all()
-            .build()
-            .expect("couldn't build tokio runtime");
         let cri_socket_path = opts.cri_socket.clone();
-        let handle = runtime.spawn(post_process(cri_socket_path, event));
+        let proc_path = opts.proc_fs_path.clone();
+        let handle = runtime.spawn(post_process(cri_socket_path, proc_path, event));
         let info = {
             let this = runtime
                 .block_on(handle)
