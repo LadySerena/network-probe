@@ -1,11 +1,12 @@
-#include "event.h"
+#include "reporter_headers.h"
 #include "vmlinux.h"
 #include <bpf/bpf_core_read.h>
 #include <bpf/bpf_helpers.h>
+#include <bpf/bpf_endian.h>
 
 char LICENSE[] SEC("license") = "Dual MPL/GPL";
 
-struct event _event = {0};
+struct bpf_event event = {0};
 
 const volatile int ancestor_level = 0;
 
@@ -19,7 +20,7 @@ int measure_packet_len(struct __sk_buff *skb) {
 
   struct task_struct *task;
   task = (struct task_struct *)bpf_get_current_task();
-  struct event *e;
+  struct bpf_event *e;
   __u64 cgroup_id = bpf_skb_cgroup_id(skb);
   // TODO make ancestor configurable via maps
   __u64 cgroup_ancestor_id = bpf_skb_ancestor_cgroup_id(skb, ancestor_level);
@@ -39,6 +40,10 @@ int measure_packet_len(struct __sk_buff *skb) {
   e->cgroup = cgroup_id;
   e->cgroup_ancestor = cgroup_ancestor_id;
   e->packet_length = skb->len;
+  e->local_port = skb->local_port;
+  e->remote_port = skb->remote_port;
+  e->local_ip4 = bpf_ntohl(skb->local_ip4);
+  e-> remote_ip4 = bpf_ntohl(skb->remote_ip4);
 
   bpf_ringbuf_submit(e, 0);
 
