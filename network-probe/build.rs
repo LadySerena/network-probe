@@ -11,7 +11,7 @@ use std::str;
 // It also will retrieve the vmlinux.h file by invoking bpftools.
 
 const SRC: &str = "src/bpf/egress.bpf.c";
-const PROBE_HEADER: &str = "src/bpf/egress.h";
+const PROBE_HEADER: &str = "src/bpf/reporter_headers.h";
 const HEADER_SRC: &str = "/sys/kernel/btf/vmlinux";
 const HEADER_DEST: &str = "src/bpf/vmlinux.h";
 

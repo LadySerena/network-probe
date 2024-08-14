@@ -8,13 +8,14 @@
 use anyhow::bail;
 use anyhow::Error;
 use clap::Parser;
-use egress::egress_types::event;
+use egress::egress_types::bpf_event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
 use libbpf_rs::skel::OpenSkel;
 use libbpf_rs::skel::Skel;
 use libbpf_rs::skel::SkelBuilder;
 use regex::Regex;
+use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
 use std::time::Duration;
@@ -23,11 +24,13 @@ use tokio::runtime::Builder;
 use tonic::transport::Endpoint;
 use tonic::transport::Uri;
 use tower::service_fn;
+use tracing::event;
+use tracing::Level;
 mod egress {
     include!(concat!(env!("OUT_DIR"), "/egress.skel.rs"));
 }
 use anyhow::Result;
-unsafe impl Plain for egress_types::event {}
+unsafe impl Plain for egress_types::bpf_event {}
 use egress::*;
 use libbpf_rs::RingBufferBuilder;
 use plain::Plain;
@@ -47,7 +50,7 @@ struct Cli {
 async fn post_process(
     cri_socket_path: PathBuf,
     proc_path: PathBuf,
-    event: event,
+    event: bpf_event,
 ) -> Result<(String, String)> {
     let re = Regex::new(r"(cri-containerd-)?([^\.]+)")?;
     // TODO pass this in instead of creating a connection for every event
@@ -161,13 +164,14 @@ async fn get_cgroup_path_from_pid(proc_path: PathBuf, pid: i32) -> Result<String
     Ok(cgroups.pathname.clone())
 }
 
-fn measure_egress(data: &[u8]) -> event {
-    let mut event = egress_types::event::default();
+fn measure_egress(data: &[u8]) -> bpf_event {
+    let mut event = egress_types::bpf_event::default();
     plain::copy_from_bytes(&mut event, data).expect("data buffer too short");
     event
 }
 
 fn main() {
+    tracing_subscriber::FmtSubscriber::builder().init();
     let opts = Cli::parse();
     let skeleton_builder = EgressSkelBuilder::default();
 
@@ -176,8 +180,7 @@ fn main() {
         match this {
             Ok(t) => t,
             Err(e) => {
-                println!("{e}");
-                println!("couldn't increase memory limit, no exiting");
+                event!(Level::ERROR, %e, "could not increase memory limit");
                 return;
             }
         }
@@ -194,26 +197,38 @@ fn main() {
     let mut ring_buffer_builder = RingBufferBuilder::new();
     let mut skeleton_maps = skeleton.maps_mut();
     let ring_buffer_callback = |data: &[u8]| -> i32 {
-        let event = measure_egress(data);
+        let egress_data = measure_egress(data);
         let cri_socket_path = opts.cri_socket.clone();
         let proc_path = opts.proc_fs_path.clone();
-        let handle = runtime.spawn(post_process(cri_socket_path, proc_path, event));
+        let handle = runtime.spawn(post_process(cri_socket_path, proc_path, egress_data));
         let info = {
             let this = runtime
                 .block_on(handle)
                 .expect("error occurred during runtime blocking");
             match this {
                 Ok(t) => t,
-                Err(e) => {
-                    println!("{e}");
+                Err(_e) => {
                     return 0;
                 }
             }
         };
-        println!(
-            "pod: {0}, namespace: {1}, bytes: {2}",
-            info.0, info.1, event.packet_length
-        );
+        let local_ip4 = Ipv4Addr::from(egress_data.local_ip4);
+        let remote_ip4 = Ipv4Addr::from(egress_data.remote_ip4);
+        // TODO to filter out kubelet health checks (at least in kind)
+        // get all nodes pod CIDRs and ignore the first ip eg 10.244.0.1
+        if info.1 != "kube-system" {
+            event!(
+                Level::INFO,
+                pod = info.0,
+                namespace = info.1,
+                bytes = egress_data.packet_length,
+                local_ip4 = local_ip4.to_string(),
+                local_port = egress_data.local_port,
+                remote_ip4 = remote_ip4.to_string(),
+                remote_port = egress_data.remote_port,
+                "received packet"
+            );
+        };
         0
     };
 
