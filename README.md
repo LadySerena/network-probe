@@ -11,6 +11,10 @@ eBPF probe to measure egress traffic by certain cgroups.
 - prometheus support
 - determine the destination of the outgoing packets
 - interface for pod metadata via CRI or kubernetes api
+- proper error handling
+- break out common functions into their own crates
+  - pid to container lib
+  - telemetry exposition lib
 
 ## running against kind
 
@@ -26,3 +30,4 @@ eBPF probe to measure egress traffic by certain cgroups.
 - [example probe argument passing](https://github.com/libbpf/libbpf-rs/blob/6f588367d86c3a35287987b093613bfb30b1b7ad/examples/runqslower/src/main.rs#L97-L99)
 - [eBPF licensing](https://ebpf.io/blog/ebpf-licensing-guide/)
 - [systemd-cgls manpage](https://man.archlinux.org/man/systemd-cgls.1.en)
+- [rust error handling](https://mmapped.blog/posts/12-rust-error-handling#implement-std-error)
