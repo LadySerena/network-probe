@@ -413,6 +413,13 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "0b6a852b24ab71dffc585bcb46eaf7959d175cb865a7152e35b348d1b2960422"
 
 [[package]]
+name = "container-meta"
+version = "0.1.0"
+dependencies = [
+ "procfs",
+]
+
+[[package]]
 name = "core-foundation"
 version = "0.9.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -1081,6 +1088,7 @@ version = "0.1.0"
 dependencies = [
  "anyhow",
  "clap",
+ "container-meta",
  "k8s-cri",
  "libbpf-cargo",
  "libbpf-rs",

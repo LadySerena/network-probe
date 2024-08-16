@@ -1,5 +1,5 @@
 [workspace]
-members = ["client", "network-probe"]
+members = ["client", "container-meta", "network-probe"]
 resolver = "2"
 
 # See more keys and their definitions at https://doc.rust-lang.org/cargo/reference/manifest.html

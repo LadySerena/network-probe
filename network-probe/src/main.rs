@@ -8,6 +8,7 @@
 use anyhow::bail;
 use anyhow::Error;
 use clap::Parser;
+use container_meta::get_cgroup_path_from_pid;
 use egress::egress_types::bpf_event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
@@ -60,7 +61,7 @@ async fn post_process(
         }))
         .await?;
     let mut client = RuntimeServiceClient::new(channel);
-    let cgroup_path = get_cgroup_path_from_pid(proc_path, event.pid).await?;
+    let cgroup_path = get_cgroup_path_from_pid(proc_path, event.pid)?;
     let container_id: String = {
         let this = cgroup_path.split('/').last();
         match this {
@@ -142,26 +143,6 @@ fn bump_memlock_rlimit() -> Result<()> {
     }
 
     Ok(())
-}
-
-async fn get_cgroup_path_from_pid(proc_path: PathBuf, pid: i32) -> Result<String> {
-    let proc_info = match procfs::process::Process::new_with_root(proc_path.join(pid.to_string())) {
-        Ok(it) => it,
-        Err(err) => {
-            return Err(err.into());
-        }
-    };
-
-    // This is for systems with cgroup v2 so we can assume process and cgroup is 1:1
-    let binding = proc_info.cgroups()?;
-    let cgroups = {
-        let this = binding.0.first();
-        match this {
-            Some(val) => val,
-            None => return Err(Error::msg(format!("could not find cgroup for pid: {pid}"))),
-        }
-    };
-    Ok(cgroups.pathname.clone())
 }
 
 fn measure_egress(data: &[u8]) -> bpf_event {
