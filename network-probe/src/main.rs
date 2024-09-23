@@ -1,20 +1,22 @@
+/*!
+eBPF probe to measure network traffic emitted by containers.
+*/
+
 #![deny(clippy::correctness)]
 #![warn(clippy::style)]
 #![warn(clippy::complexity)]
 #![warn(clippy::suspicious)]
 #![deny(deprecated)]
 #![warn(clippy::perf)]
+#![warn(missing_docs)]
 
-use anyhow::bail;
-use anyhow::Error;
+mod init;
+
 use clap::Parser;
 use container_meta::get_cgroup_path_from_pid;
 use egress::egress_types::bpf_event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
-use libbpf_rs::skel::OpenSkel;
-use libbpf_rs::skel::Skel;
-use libbpf_rs::skel::SkelBuilder;
 use regex::Regex;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
@@ -22,11 +24,13 @@ use std::path::PathBuf;
 use std::time::Duration;
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
+use tokio::runtime::Runtime;
 use tonic::transport::Endpoint;
 use tonic::transport::Uri;
 use tower::service_fn;
 use tracing::event;
 use tracing::Level;
+/// rust bindings for the ebpf skeleton.
 mod egress {
     include!(concat!(env!("OUT_DIR"), "/egress.skel.rs"));
 }
@@ -36,23 +40,34 @@ use egress::*;
 use libbpf_rs::RingBufferBuilder;
 use plain::Plain;
 
+use crate::init::bump_memlock_rlimit;
+use crate::init::setup_skeleton;
+use crate::init::setup_tracing;
+
+/// Defines the CLI arguments using clap's derive API.
 #[derive(Debug, Parser)]
 struct Cli {
-    #[arg(short, long)]
-    ancestor_level: i32,
-    #[arg(short = 'c', long)]
-    cri_socket: PathBuf,
     #[arg(short = 'g', long)]
     cgroup_path: PathBuf,
+    #[arg(short = 'c', long)]
+    cri_socket: PathBuf,
     #[arg(short = 'p', long)]
     proc_fs_path: PathBuf,
+}
+
+struct EnrichedData {
+    pod_name: String,
+    pod_namespace: String,
+    local_ipv4: Ipv4Addr,
+    remote_ipv4: Ipv4Addr,
+    raw_event: bpf_event,
 }
 
 async fn post_process(
     cri_socket_path: PathBuf,
     proc_path: PathBuf,
     event: bpf_event,
-) -> Result<(String, String)> {
+) -> Result<EnrichedData> {
     let re = Regex::new(r"(cri-containerd-)?([^\.]+)")?;
     // TODO pass this in instead of creating a connection for every event
     let channel = Endpoint::try_from("http://[::]")?
@@ -67,7 +82,7 @@ async fn post_process(
         match this {
             Some(val) => val,
             None => {
-                return Err(Error::msg(format!(
+                return Err(anyhow::Error::msg(format!(
                     "failed to find container_id from cgroup: {cgroup_path}"
                 )));
             }
@@ -79,13 +94,13 @@ async fn post_process(
             let this = re.captures(&container_id);
             match this {
                 Some(val) => val,
-                None => return Err(Error::msg("regex failed match")),
+                None => return Err(anyhow::Error::msg("regex failed match")),
             }
         }
         .get(2);
         match this {
             Some(val) => val,
-            None => return Err(Error::msg("not found in 1")),
+            None => return Err(anyhow::Error::msg("not found in 1")),
         }
     };
     let request = ContainerStatusRequest {
@@ -98,7 +113,7 @@ async fn post_process(
         match this {
             Some(val) => val,
             None => {
-                return Err(Error::msg(format!(
+                return Err(anyhow::Error::msg(format!(
                     "could not retrieve pod status from {}",
                     container_id.clone()
                 )));
@@ -111,7 +126,7 @@ async fn post_process(
         match this {
             Some(val) => val,
             None => {
-                return Err(Error::msg(format!(
+                return Err(anyhow::Error::msg(format!(
                     "could not retrive pod name from metadata for container: {container_id}"
                 )))
             }
@@ -122,27 +137,21 @@ async fn post_process(
         match this {
             Some(val) => val,
             None => {
-                return Err(Error::msg(format!(
+                return Err(anyhow::Error::msg(format!(
                     "could not retrieve pod namespace for pod: {pod_name}"
                 )))
             }
         }
     };
-    Ok((pod_name.to_string(), namespace.to_string()))
-}
-
-// upstream uses this to bump memory limits for the probes
-fn bump_memlock_rlimit() -> Result<()> {
-    let rlimit = libc::rlimit {
-        rlim_cur: 128 << 20,
-        rlim_max: 128 << 20,
-    };
-
-    if unsafe { libc::setrlimit(libc::RLIMIT_MEMLOCK, &rlimit) } != 0 {
-        bail!("Failed to increase rlimit");
-    }
-
-    Ok(())
+    let local_ipv4 = Ipv4Addr::from(event.local_ip4);
+    let remote_ipv4 = Ipv4Addr::from(event.remote_ip4);
+    Ok(EnrichedData {
+        pod_name: pod_name.to_string(),
+        pod_namespace: namespace.to_string(),
+        local_ipv4,
+        remote_ipv4,
+        raw_event: event,
+    })
 }
 
 fn measure_egress(data: &[u8]) -> bpf_event {
@@ -151,75 +160,78 @@ fn measure_egress(data: &[u8]) -> bpf_event {
     event
 }
 
-fn main() {
-    tracing_subscriber::FmtSubscriber::builder().init();
-    let opts = Cli::parse();
-    let skeleton_builder = EgressSkelBuilder::default();
+type RingBufferCallback = Box<dyn Fn(&[u8]) -> i32>;
 
-    {
-        let this = bump_memlock_rlimit();
-        match this {
-            Ok(t) => t,
+fn callback(runtime: Runtime, proc_path: PathBuf, cri_socket_path: PathBuf) -> RingBufferCallback {
+    // return 0 to continue operation
+
+    let meep = move |data: &[u8]| -> i32 {
+        let event = measure_egress(data);
+        let handle = runtime.spawn(post_process(
+            cri_socket_path.clone(),
+            proc_path.clone(),
+            event,
+        ));
+
+        let thread_output = runtime.block_on(handle);
+
+        let process = match thread_output {
+            Ok(result) => match result {
+                Ok(process_info) => process_info,
+                Err(e) => {
+                    event!(
+                        Level::ERROR,
+                        "could not get data from container runtime {e}"
+                    );
+                    // we could have run into a container not found error so that does not justify killing the process
+                    return 0;
+                }
+            },
             Err(e) => {
-                event!(Level::ERROR, %e, "could not increase memory limit");
-                return;
+                event!(Level::ERROR, "worker failed due to {e}");
+                return 1;
             }
-        }
-    };
-    let mut open_skeleton = skeleton_builder.open().expect("couldn't open skeleton");
-    open_skeleton.rodata_mut().ancestor_level = opts.ancestor_level;
+        };
+        event!(
+            Level::INFO,
+            pod = process.pod_name,
+            namespace = process.pod_namespace,
+            bytes = process.raw_event.packet_length,
+            local_ip4 = process.local_ipv4.to_string(),
+            local_port = process.raw_event.local_port,
+            remote_ip4 = process.remote_ipv4.to_string(),
+            remote_port = process.raw_event.remote_port,
+            "received packet"
+        );
 
-    let mut skeleton = open_skeleton.load().expect("couldn't load from skeleton");
-    skeleton.attach().expect("couldn't attach ebpf program");
+        0
+    };
+    Box::new(meep)
+}
+
+fn main() {
+    bump_memlock_rlimit();
+    setup_tracing();
+    let opts = Cli::parse();
+
     let runtime = Builder::new_multi_thread()
         .enable_all()
         .build()
         .expect("couldn't build tokio runtime");
     let mut ring_buffer_builder = RingBufferBuilder::new();
+    let mut skeleton = setup_skeleton()
+        .expect("skeleton should open since the bpf program should have compiled sucessfully");
     let mut skeleton_maps = skeleton.maps_mut();
-    let ring_buffer_callback = |data: &[u8]| -> i32 {
-        let egress_data = measure_egress(data);
-        let cri_socket_path = opts.cri_socket.clone();
-        let proc_path = opts.proc_fs_path.clone();
-        let handle = runtime.spawn(post_process(cri_socket_path, proc_path, egress_data));
-        let info = {
-            let this = runtime
-                .block_on(handle)
-                .expect("error occurred during runtime blocking");
-            match this {
-                Ok(t) => t,
-                Err(_e) => {
-                    return 0;
-                }
-            }
-        };
-        let local_ip4 = Ipv4Addr::from(egress_data.local_ip4);
-        let remote_ip4 = Ipv4Addr::from(egress_data.remote_ip4);
-        // TODO to filter out kubelet health checks (at least in kind)
-        // get all nodes pod CIDRs and ignore the first ip eg 10.244.0.1
-        if info.1 != "kube-system" {
-            event!(
-                Level::INFO,
-                pod = info.0,
-                namespace = info.1,
-                bytes = egress_data.packet_length,
-                local_ip4 = local_ip4.to_string(),
-                local_port = egress_data.local_port,
-                remote_ip4 = remote_ip4.to_string(),
-                remote_port = egress_data.remote_port,
-                "received packet"
-            );
-        };
-        0
-    };
 
     ring_buffer_builder
-        .add(skeleton_maps.rb(), ring_buffer_callback)
-        .expect("couldn't add callback to ring buffer");
+        .add(
+            skeleton_maps.rb(),
+            callback(runtime, opts.proc_fs_path, opts.cri_socket),
+        )
+        .expect("should be able to open ringbuffer with appropriate permissions");
     let ring_buffer = ring_buffer_builder
         .build()
-        .expect("couldn't build ring buffer");
-    println!("starting");
+        .expect("should be able to open ringbuffer with appropriate permissions");
 
     let f = {
         let this = std::fs::OpenOptions::new()
