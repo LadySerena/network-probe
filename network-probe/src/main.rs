@@ -19,6 +19,13 @@ use container_meta::get_cgroup_path_from_pid;
 use egress::egress_types::bpf_event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
+use opentelemetry::global;
+use opentelemetry::metrics::MeterProvider;
+use opentelemetry::KeyValue;
+use opentelemetry_sdk::metrics::SdkMeterProvider;
+use prometheus::Encoder;
+use prometheus::Registry;
+use prometheus::TextEncoder;
 use regex::Regex;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
@@ -182,8 +189,15 @@ fn tokio_stuff(
     cri_socket_path: PathBuf,
     proc_path: PathBuf,
     mut channel: sync::mpsc::Receiver<bpf_event>,
+    prom_registry: Registry,
 ) {
     let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+    let meter = global::meter("network-probe");
+    let counter = meter
+        .u64_counter("pod.network.egress")
+        .with_unit("By")
+        .with_description("number of bytes sent by the pod")
+        .init();
     runtime.spawn(async move {
         while let Some(event) = channel.recv().await {
             let data = post_process(cri_socket_path.clone(), proc_path.clone(), event).await;
@@ -200,6 +214,13 @@ fn tokio_stuff(
                         remote_port = process.raw_event.remote_port,
                         "received packet"
                     );
+                    counter.add(
+                        process.raw_event.packet_length.into(),
+                        &[
+                            KeyValue::new("pod_name", process.pod_name),
+                            KeyValue::new("pod_namespace", process.pod_namespace),
+                        ],
+                    );
                 }
                 Err(e) => {
                     event!(Level::ERROR, "couldn't parse data {e}");
@@ -209,7 +230,16 @@ fn tokio_stuff(
     });
 
     let server_handle = runtime.spawn(async {
-        let metrics = Router::new().route("/metrics", get(|| async { "testing" }));
+        let metrics = Router::new().route(
+            "/metrics",
+            get(|| async move {
+                let encoder = TextEncoder::new();
+                let metric_families = prom_registry.gather();
+                let mut result = Vec::new();
+                encoder.encode(&metric_families, &mut result).unwrap();
+                result
+            }),
+        );
         let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
         axum::serve(listener, metrics).await.unwrap();
     });
@@ -221,6 +251,15 @@ fn main() {
     bump_memlock_rlimit();
     setup_tracing();
     let opts = Cli::parse();
+
+    let registry = prometheus::Registry::new();
+    let exporter = opentelemetry_prometheus::exporter()
+        .with_registry(registry.clone())
+        .build()
+        .unwrap();
+
+    let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    global::set_meter_provider(provider.clone());
 
     let (sender, receiver) = sync::mpsc::channel::<bpf_event>(1000);
 
@@ -269,7 +308,14 @@ fn main() {
 
     thread::Builder::new()
         .name("async-tasks".to_string())
-        .spawn(move || tokio_stuff(opts.cri_socket.clone(), opts.proc_fs_path.clone(), receiver))
+        .spawn(move || {
+            tokio_stuff(
+                opts.cri_socket.clone(),
+                opts.proc_fs_path.clone(),
+                receiver,
+                registry,
+            )
+        })
         .unwrap();
 
     loop {
