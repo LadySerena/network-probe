@@ -21,6 +21,7 @@ use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider;
+use opentelemetry::metrics::UpDownCounter;
 use opentelemetry::KeyValue;
 use opentelemetry_sdk::metrics::SdkMeterProvider;
 use prometheus::Encoder;
@@ -30,6 +31,7 @@ use regex::Regex;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -40,8 +42,6 @@ use tokio::sync::mpsc::Sender;
 use tonic::transport::Endpoint;
 use tonic::transport::Uri;
 use tower::service_fn;
-use tracing::event;
-use tracing::Level;
 /// rust bindings for the ebpf skeleton.
 mod egress {
     include!(concat!(env!("OUT_DIR"), "/egress.skel.rs"));
@@ -174,12 +174,16 @@ fn measure_egress(data: &[u8]) -> bpf_event {
 
 type RingBufferCallback = Box<dyn Fn(&[u8]) -> i32>;
 
-fn callback(sender: Sender<bpf_event>) -> RingBufferCallback {
+fn callback(
+    sender: Sender<bpf_event>,
+    channel_guage: Arc<UpDownCounter<i64>>,
+) -> RingBufferCallback {
     // return 0 to continue operation
 
     let meep = move |data: &[u8]| -> i32 {
         let event = measure_egress(data);
         sender.blocking_send(event).unwrap();
+        channel_guage.add(-1, &[KeyValue::new("queue_name", "enrichment")]);
         0
     };
     Box::new(meep)
@@ -190,6 +194,7 @@ fn tokio_stuff(
     proc_path: PathBuf,
     mut channel: sync::mpsc::Receiver<bpf_event>,
     prom_registry: Registry,
+    channel_gauge: Arc<UpDownCounter<i64>>,
 ) {
     let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
     let meter = global::meter("network-probe");
@@ -200,32 +205,22 @@ fn tokio_stuff(
         .init();
     runtime.spawn(async move {
         while let Some(event) = channel.recv().await {
+            channel_gauge.add(1, &[KeyValue::new("queue_name", "enrichment")]);
             let data = post_process(cri_socket_path.clone(), proc_path.clone(), event).await;
-            match data {
-                Ok(process) => {
-                    event!(
-                        Level::INFO,
-                        pod = process.pod_name,
-                        namespace = process.pod_namespace,
-                        bytes = process.raw_event.packet_length,
-                        local_ip4 = process.local_ipv4.to_string(),
-                        local_port = process.raw_event.local_port,
-                        remote_ip4 = process.remote_ipv4.to_string(),
-                        remote_port = process.raw_event.remote_port,
-                        "received packet"
-                    );
-                    counter.add(
-                        process.raw_event.packet_length.into(),
-                        &[
-                            KeyValue::new("pod_name", process.pod_name),
-                            KeyValue::new("pod_namespace", process.pod_namespace),
-                        ],
-                    );
-                }
-                Err(e) => {
-                    event!(Level::ERROR, "couldn't parse data {e}");
-                }
+            let Ok(process) = data else {
+                // we can pick up node processes which don't have container names
+                // it is better to ignore and continue processing
+                continue;
             };
+            counter.add(
+                process.raw_event.packet_length.into(),
+                &[
+                    KeyValue::new("pod_name", process.pod_name),
+                    KeyValue::new("pod_namespace", process.pod_namespace),
+                    KeyValue::new("remote_ip", process.remote_ipv4.to_string()),
+                    KeyValue::new("local_ip", process.local_ipv4.to_string()),
+                ],
+            );
         }
     });
 
@@ -259,9 +254,26 @@ fn main() {
         .unwrap();
 
     let provider = SdkMeterProvider::builder().with_reader(exporter).build();
+    let meter = provider.meter("network-probe");
     global::set_meter_provider(provider.clone());
 
-    let (sender, receiver) = sync::mpsc::channel::<bpf_event>(1000);
+    let capacity: i64 = 1000;
+
+    let (sender, receiver) = sync::mpsc::channel::<bpf_event>(
+        capacity
+            .try_into()
+            .expect("initial capacity ({capacity}) to be less than usize max ({usize.MAX})"),
+    );
+
+    let capacity_counter = meter
+        .i64_up_down_counter("channel.capacity")
+        .with_description("available slots within the channel")
+        .with_unit("{item}")
+        .init();
+
+    capacity_counter.add(capacity, &[KeyValue::new("queue_name", "enrichment")]);
+
+    let capacity_pointer = Arc::new(capacity_counter);
 
     let mut ring_buffer_builder = RingBufferBuilder::new();
     let mut skeleton = setup_skeleton()
@@ -269,7 +281,10 @@ fn main() {
     let mut skeleton_maps = skeleton.maps_mut();
 
     ring_buffer_builder
-        .add(skeleton_maps.rb(), callback(sender))
+        .add(
+            skeleton_maps.rb(),
+            callback(sender, capacity_pointer.clone()),
+        )
         .expect("should be able to open ringbuffer with appropriate permissions");
     let ring_buffer = ring_buffer_builder
         .build()
@@ -314,6 +329,7 @@ fn main() {
                 opts.proc_fs_path.clone(),
                 receiver,
                 registry,
+                capacity_pointer,
             )
         })
         .unwrap();
