@@ -25,6 +25,7 @@ tower = "0.4.13"
 tracing = "0.1.40"
 tracing-subscriber = "0.3.18"
 container-meta = {path = "../container-meta"}
+axum = "0.7.6"
 
 [build-dependencies]
 libbpf-cargo = "0.23.3"

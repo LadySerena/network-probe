@@ -12,6 +12,8 @@ eBPF probe to measure network traffic emitted by containers.
 
 mod init;
 
+use axum::routing::get;
+use axum::Router;
 use clap::Parser;
 use container_meta::get_cgroup_path_from_pid;
 use egress::egress_types::bpf_event;
@@ -21,10 +23,13 @@ use regex::Regex;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
+use std::thread;
 use std::time::Duration;
+use tokio::net::TcpListener;
 use tokio::net::UnixStream;
 use tokio::runtime::Builder;
-use tokio::runtime::Runtime;
+use tokio::sync;
+use tokio::sync::mpsc::Sender;
 use tonic::transport::Endpoint;
 use tonic::transport::Uri;
 use tower::service_fn;
@@ -76,7 +81,7 @@ async fn post_process(
         }))
         .await?;
     let mut client = RuntimeServiceClient::new(channel);
-    let cgroup_path = get_cgroup_path_from_pid(proc_path, event.pid)?;
+    let cgroup_path = get_cgroup_path_from_pid(&proc_path, event.pid)?;
     let container_id: String = {
         let this = cgroup_path.split('/').last();
         match this {
@@ -162,51 +167,54 @@ fn measure_egress(data: &[u8]) -> bpf_event {
 
 type RingBufferCallback = Box<dyn Fn(&[u8]) -> i32>;
 
-fn callback(runtime: Runtime, proc_path: PathBuf, cri_socket_path: PathBuf) -> RingBufferCallback {
+fn callback(sender: Sender<bpf_event>) -> RingBufferCallback {
     // return 0 to continue operation
 
     let meep = move |data: &[u8]| -> i32 {
         let event = measure_egress(data);
-        let handle = runtime.spawn(post_process(
-            cri_socket_path.clone(),
-            proc_path.clone(),
-            event,
-        ));
-
-        let thread_output = runtime.block_on(handle);
-
-        let process = match thread_output {
-            Ok(result) => match result {
-                Ok(process_info) => process_info,
-                Err(e) => {
-                    event!(
-                        Level::ERROR,
-                        "could not get data from container runtime {e}"
-                    );
-                    // we could have run into a container not found error so that does not justify killing the process
-                    return 0;
-                }
-            },
-            Err(e) => {
-                event!(Level::ERROR, "worker failed due to {e}");
-                return 1;
-            }
-        };
-        event!(
-            Level::INFO,
-            pod = process.pod_name,
-            namespace = process.pod_namespace,
-            bytes = process.raw_event.packet_length,
-            local_ip4 = process.local_ipv4.to_string(),
-            local_port = process.raw_event.local_port,
-            remote_ip4 = process.remote_ipv4.to_string(),
-            remote_port = process.raw_event.remote_port,
-            "received packet"
-        );
-
+        sender.blocking_send(event).unwrap();
         0
     };
     Box::new(meep)
+}
+
+fn tokio_stuff(
+    cri_socket_path: PathBuf,
+    proc_path: PathBuf,
+    mut channel: sync::mpsc::Receiver<bpf_event>,
+) {
+    let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
+    runtime.spawn(async move {
+        while let Some(event) = channel.recv().await {
+            let data = post_process(cri_socket_path.clone(), proc_path.clone(), event).await;
+            match data {
+                Ok(process) => {
+                    event!(
+                        Level::INFO,
+                        pod = process.pod_name,
+                        namespace = process.pod_namespace,
+                        bytes = process.raw_event.packet_length,
+                        local_ip4 = process.local_ipv4.to_string(),
+                        local_port = process.raw_event.local_port,
+                        remote_ip4 = process.remote_ipv4.to_string(),
+                        remote_port = process.raw_event.remote_port,
+                        "received packet"
+                    );
+                }
+                Err(e) => {
+                    event!(Level::ERROR, "couldn't parse data {e}");
+                }
+            };
+        }
+    });
+
+    let server_handle = runtime.spawn(async {
+        let metrics = Router::new().route("/metrics", get(|| async { "testing" }));
+        let listener = TcpListener::bind("0.0.0.0:3000").await.unwrap();
+        axum::serve(listener, metrics).await.unwrap();
+    });
+
+    runtime.block_on(server_handle).unwrap();
 }
 
 fn main() {
@@ -214,20 +222,15 @@ fn main() {
     setup_tracing();
     let opts = Cli::parse();
 
-    let runtime = Builder::new_multi_thread()
-        .enable_all()
-        .build()
-        .expect("couldn't build tokio runtime");
+    let (sender, receiver) = sync::mpsc::channel::<bpf_event>(1000);
+
     let mut ring_buffer_builder = RingBufferBuilder::new();
     let mut skeleton = setup_skeleton()
         .expect("skeleton should open since the bpf program should have compiled sucessfully");
     let mut skeleton_maps = skeleton.maps_mut();
 
     ring_buffer_builder
-        .add(
-            skeleton_maps.rb(),
-            callback(runtime, opts.proc_fs_path, opts.cri_socket),
-        )
+        .add(skeleton_maps.rb(), callback(sender))
         .expect("should be able to open ringbuffer with appropriate permissions");
     let ring_buffer = ring_buffer_builder
         .build()
@@ -263,13 +266,17 @@ fn main() {
             }
         }
     };
+
+    thread::Builder::new()
+        .name("async-tasks".to_string())
+        .spawn(move || tokio_stuff(opts.cri_socket.clone(), opts.proc_fs_path.clone(), receiver))
+        .unwrap();
+
     loop {
-        {
-            let this = ring_buffer.poll(Duration::from_millis(100));
-            match this {
-                Ok(t) => t,
-                Err(e) => println!("{e}"),
-            }
-        };
+        let this = ring_buffer.poll(Duration::from_millis(100));
+        match this {
+            Ok(t) => t,
+            Err(e) => println!("{e}"),
+        }
     }
 }

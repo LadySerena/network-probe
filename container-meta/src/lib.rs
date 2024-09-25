@@ -1,4 +1,8 @@
-use std::{error::Error, fmt::Display, path::PathBuf};
+use std::{
+    error::Error,
+    fmt::Display,
+    path::{Path, PathBuf},
+};
 
 use procfs::process::Process;
 
@@ -32,7 +36,7 @@ impl Display for MetadataError {
     }
 }
 
-pub fn get_cgroup_path_from_pid(proc_path: PathBuf, pid: i32) -> Result<String, MetadataError> {
+pub fn get_cgroup_path_from_pid(proc_path: &Path, pid: i32) -> Result<String, MetadataError> {
     let joined_path = proc_path.join(pid.to_string());
     let proc_info = match Process::new_with_root(joined_path.clone()) {
         Ok(p) => p,
