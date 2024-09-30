@@ -3,8 +3,11 @@
 
   inputs = {
     nixpkgs.url = "github:NixOS/nixpkgs/nixos-unstable";
-    rust-overlay.url = "github:oxalica/rust-overlay";
-    flake-utils.url = "github:numtide/flake-utils";
+    rust-overlay = {
+      url = "github:oxalica/rust-overlay";
+      inputs.nixpkgs.follows = "nixpkgs";
+    };
+    flake-utils = { url = "github:numtide/flake-utils"; };
   };
 
   outputs = { nixpkgs, rust-overlay, flake-utils, ... }:
@@ -17,13 +20,10 @@
         devShells.default = with pkgs;
           mkShell {
             nativeBuildInputs = [ pkg-config elfutils ];
-            buildInputs = [
-              clang
-              clang-tools
-              openssl
-              elfutils
-              rust-bin.stable.latest.default
-            ] ++ libs;
+            # stack protection nor zerocallusedregs support bpf targets 
+            hardeningDisable = [ "stackprotector" "zerocallusedregs" ];
+            buildInputs =
+              [ clang openssl elfutils rust-bin.stable.latest.default ] ++ libs;
 
           };
       });

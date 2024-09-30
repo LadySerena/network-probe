@@ -19,6 +19,7 @@ use container_meta::get_cgroup_path_from_pid;
 use egress::egress_types::bpf_event;
 use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
 use k8s_cri::v1::ContainerStatusRequest;
+use kube::Api;
 use opentelemetry::global;
 use opentelemetry::metrics::MeterProvider;
 use opentelemetry::metrics::UpDownCounter;
@@ -28,10 +29,10 @@ use prometheus::Encoder;
 use prometheus::Registry;
 use prometheus::TextEncoder;
 use regex::Regex;
+use std::cell::LazyCell;
 use std::net::Ipv4Addr;
 use std::os::fd::AsRawFd;
 use std::path::PathBuf;
-use std::sync::Arc;
 use std::thread;
 use std::time::Duration;
 use tokio::net::TcpListener;
@@ -73,6 +74,16 @@ struct EnrichedData {
     local_ipv4: Ipv4Addr,
     remote_ipv4: Ipv4Addr,
     raw_event: bpf_event,
+}
+
+async fn kube_process(
+    pod_api: Api<k8s_openapi::api::core::v1::Pod>,
+    event: bpf_event,
+    proc_path: PathBuf,
+    re: &Regex,
+) -> Result<EnrichedData> {
+    let cgroup_path = get_cgroup_path_from_pid(&proc_path, event.pid)?;
+    todo!()
 }
 
 async fn post_process(
@@ -174,10 +185,7 @@ fn measure_egress(data: &[u8]) -> bpf_event {
 
 type RingBufferCallback = Box<dyn Fn(&[u8]) -> i32>;
 
-fn callback(
-    sender: Sender<bpf_event>,
-    channel_guage: Arc<UpDownCounter<i64>>,
-) -> RingBufferCallback {
+fn callback(sender: Sender<bpf_event>, channel_guage: UpDownCounter<i64>) -> RingBufferCallback {
     // return 0 to continue operation
 
     let meep = move |data: &[u8]| -> i32 {
@@ -194,13 +202,16 @@ fn tokio_stuff(
     proc_path: PathBuf,
     mut channel: sync::mpsc::Receiver<bpf_event>,
     prom_registry: Registry,
-    channel_gauge: Arc<UpDownCounter<i64>>,
+    channel_gauge: UpDownCounter<i64>,
 ) {
+    let re: LazyCell<Regex> = LazyCell::new(|| {
+        Regex::new(r"(cri-containerd-)?([^\.]+)").expect("static regex should succeed")
+    });
     let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
     let meter = global::meter("network-probe");
     let counter = meter
         .u64_counter("pod.network.egress")
-        .with_unit("By")
+        .with_unit("By") // bytes according to https://ucum.org/ by way of the otel spec
         .with_description("number of bytes sent by the pod")
         .init();
     runtime.spawn(async move {
@@ -273,8 +284,6 @@ fn main() {
 
     capacity_counter.add(capacity, &[KeyValue::new("queue_name", "enrichment")]);
 
-    let capacity_pointer = Arc::new(capacity_counter);
-
     let mut ring_buffer_builder = RingBufferBuilder::new();
     let mut skeleton = setup_skeleton()
         .expect("skeleton should open since the bpf program should have compiled sucessfully");
@@ -283,7 +292,7 @@ fn main() {
     ring_buffer_builder
         .add(
             skeleton_maps.rb(),
-            callback(sender, capacity_pointer.clone()),
+            callback(sender, capacity_counter.clone()),
         )
         .expect("should be able to open ringbuffer with appropriate permissions");
     let ring_buffer = ring_buffer_builder
@@ -329,7 +338,7 @@ fn main() {
                 opts.proc_fs_path.clone(),
                 receiver,
                 registry,
-                capacity_pointer,
+                capacity_counter,
             )
         })
         .unwrap();
