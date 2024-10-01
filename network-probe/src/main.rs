@@ -1,7 +1,7 @@
 /*!
 eBPF probe to measure network traffic emitted by containers.
 */
-
+#![deny(unused_crate_dependencies)]
 #![deny(clippy::correctness)]
 #![warn(clippy::style)]
 #![warn(clippy::complexity)]
@@ -12,51 +12,41 @@ eBPF probe to measure network traffic emitted by containers.
 
 mod init;
 
-use axum::routing::get;
-use axum::Router;
+use std::{
+    env,
+    net::{IpAddr, Ipv4Addr},
+    os::fd::AsRawFd,
+    path::PathBuf,
+    thread,
+    time::Duration,
+};
+
+use axum::{routing::get, Router};
 use clap::Parser;
-use container_meta::get_cgroup_path_from_pid;
 use egress::egress_types::bpf_event;
-use k8s_cri::v1::runtime_service_client::RuntimeServiceClient;
-use k8s_cri::v1::ContainerStatusRequest;
-use kube::Api;
-use opentelemetry::global;
-use opentelemetry::metrics::MeterProvider;
-use opentelemetry::metrics::UpDownCounter;
-use opentelemetry::KeyValue;
+use ipnet::IpAddrRange;
+use kube::{api::ListParams, Api, Client, ResourceExt};
+use opentelemetry::{
+    global,
+    metrics::{MeterProvider, UpDownCounter},
+    KeyValue,
+};
 use opentelemetry_sdk::metrics::SdkMeterProvider;
-use prometheus::Encoder;
-use prometheus::Registry;
-use prometheus::TextEncoder;
-use regex::Regex;
-use std::cell::LazyCell;
-use std::net::Ipv4Addr;
-use std::os::fd::AsRawFd;
-use std::path::PathBuf;
-use std::thread;
-use std::time::Duration;
-use tokio::net::TcpListener;
-use tokio::net::UnixStream;
-use tokio::runtime::Builder;
-use tokio::sync;
-use tokio::sync::mpsc::Sender;
-use tonic::transport::Endpoint;
-use tonic::transport::Uri;
-use tower::service_fn;
+use prometheus::{Encoder, Registry, TextEncoder};
+use tokio::{net::TcpListener, runtime, sync, sync::mpsc::Sender, task, try_join};
+use tracing::{event, Level};
 /// rust bindings for the ebpf skeleton.
 mod egress {
     include!(concat!(env!("OUT_DIR"), "/egress.skel.rs"));
 }
 use anyhow::Result;
-unsafe impl Plain for egress_types::bpf_event {}
 use egress::*;
 use libbpf_rs::RingBufferBuilder;
 use plain::Plain;
 
-use crate::init::bump_memlock_rlimit;
-use crate::init::setup_skeleton;
-use crate::init::setup_tracing;
+use crate::init::{bump_memlock_rlimit, setup_skeleton, setup_tracing};
 
+unsafe impl Plain for egress_types::bpf_event {}
 /// Defines the CLI arguments using clap's derive API.
 #[derive(Debug, Parser)]
 struct Cli {
@@ -66,6 +56,8 @@ struct Cli {
     cri_socket: PathBuf,
     #[arg(short = 'p', long)]
     proc_fs_path: PathBuf,
+    #[arg(short = 'a', long)]
+    cluster_cidr: ipnet::IpNet,
 }
 
 struct EnrichedData {
@@ -76,97 +68,22 @@ struct EnrichedData {
     raw_event: bpf_event,
 }
 
-async fn kube_process(
-    pod_api: Api<k8s_openapi::api::core::v1::Pod>,
-    event: bpf_event,
-    proc_path: PathBuf,
-    re: &Regex,
-) -> Result<EnrichedData> {
-    let cgroup_path = get_cgroup_path_from_pid(&proc_path, event.pid)?;
-    todo!()
-}
-
 async fn post_process(
-    cri_socket_path: PathBuf,
-    proc_path: PathBuf,
     event: bpf_event,
+    pod_api: &Api<k8s_openapi::api::core::v1::Pod>,
 ) -> Result<EnrichedData> {
-    let re = Regex::new(r"(cri-containerd-)?([^\.]+)")?;
-    // TODO pass this in instead of creating a connection for every event
-    let channel = Endpoint::try_from("http://[::]")?
-        .connect_with_connector(service_fn(move |_: Uri| {
-            UnixStream::connect(cri_socket_path.clone())
-        }))
-        .await?;
-    let mut client = RuntimeServiceClient::new(channel);
-    let cgroup_path = get_cgroup_path_from_pid(&proc_path, event.pid)?;
-    let container_id: String = {
-        let this = cgroup_path.split('/').last();
-        match this {
-            Some(val) => val,
-            None => {
-                return Err(anyhow::Error::msg(format!(
-                    "failed to find container_id from cgroup: {cgroup_path}"
-                )));
-            }
-        }
-    }
-    .to_string();
-    let clean_id = {
-        let this = {
-            let this = re.captures(&container_id);
-            match this {
-                Some(val) => val,
-                None => return Err(anyhow::Error::msg("regex failed match")),
-            }
-        }
-        .get(2);
-        match this {
-            Some(val) => val,
-            None => return Err(anyhow::Error::msg("not found in 1")),
-        }
-    };
-    let request = ContainerStatusRequest {
-        container_id: clean_id.as_str().to_string(),
-        verbose: true,
-    };
-    let response = client.container_status(request).await?.into_inner();
-    let status = {
-        let this = response.status;
-        match this {
-            Some(val) => val,
-            None => {
-                return Err(anyhow::Error::msg(format!(
-                    "could not retrieve pod status from {}",
-                    container_id.clone()
-                )));
-            }
-        }
-    }
-    .labels;
-    let pod_name = {
-        let this = status.get("io.kubernetes.pod.name");
-        match this {
-            Some(val) => val,
-            None => {
-                return Err(anyhow::Error::msg(format!(
-                    "could not retrive pod name from metadata for container: {container_id}"
-                )))
-            }
-        }
-    };
-    let namespace = {
-        let this = status.get("io.kubernetes.pod.namespace");
-        match this {
-            Some(val) => val,
-            None => {
-                return Err(anyhow::Error::msg(format!(
-                    "could not retrieve pod namespace for pod: {pod_name}"
-                )))
-            }
-        }
-    };
     let local_ipv4 = Ipv4Addr::from(event.local_ip4);
+    let params = ListParams::default()
+        .fields(format!("status.podIP={local_ipv4}").as_str())
+        .limit(1);
+    let list = pod_api.list(&params).await?;
+    let Some(pod) = list.iter().next() else {
+        return Err(anyhow::Error::msg(format!(
+            "could not find pod for ip {local_ipv4}"
+        )));
+    };
+    let pod_name = pod.name_any();
+    let namespace = pod.namespace().unwrap_or("unknown".to_string());
     let remote_ipv4 = Ipv4Addr::from(event.remote_ip4);
     Ok(EnrichedData {
         pod_name: pod_name.to_string(),
@@ -185,11 +102,22 @@ fn measure_egress(data: &[u8]) -> bpf_event {
 
 type RingBufferCallback = Box<dyn Fn(&[u8]) -> i32>;
 
-fn callback(sender: Sender<bpf_event>, channel_guage: UpDownCounter<i64>) -> RingBufferCallback {
+fn callback(
+    sender: Sender<bpf_event>,
+    channel_guage: UpDownCounter<i64>,
+    cluster_cidr: ipnet::IpNet,
+    own_ip: IpAddr,
+) -> RingBufferCallback {
     // return 0 to continue operation
 
     let meep = move |data: &[u8]| -> i32 {
         let event = measure_egress(data);
+        let packet_ip = IpAddr::V4(Ipv4Addr::from(event.local_ip4));
+        // TODO ignore pod's own network requests to apiserver
+        if !cluster_cidr.contains(&packet_ip) || packet_ip == own_ip {
+            // ignore non kubernetes pod packet
+            return 0;
+        }
         sender.blocking_send(event).unwrap();
         channel_guage.add(-1, &[KeyValue::new("queue_name", "enrichment")]);
         0
@@ -197,31 +125,30 @@ fn callback(sender: Sender<bpf_event>, channel_guage: UpDownCounter<i64>) -> Rin
     Box::new(meep)
 }
 
-fn tokio_stuff(
-    cri_socket_path: PathBuf,
-    proc_path: PathBuf,
+async fn setup_tasks(
     mut channel: sync::mpsc::Receiver<bpf_event>,
     prom_registry: Registry,
     channel_gauge: UpDownCounter<i64>,
 ) {
-    let re: LazyCell<Regex> = LazyCell::new(|| {
-        Regex::new(r"(cri-containerd-)?([^\.]+)").expect("static regex should succeed")
-    });
-    let runtime = Builder::new_multi_thread().enable_all().build().unwrap();
     let meter = global::meter("network-probe");
     let counter = meter
         .u64_counter("pod.network.egress")
         .with_unit("By") // bytes according to https://ucum.org/ by way of the otel spec
         .with_description("number of bytes sent by the pod")
         .init();
-    runtime.spawn(async move {
+
+    let enrichment_handle = task::spawn(async move {
+        let client = Client::try_default().await.unwrap();
+        let pod_api: Api<k8s_openapi::api::core::v1::Pod> = Api::all(client);
         while let Some(event) = channel.recv().await {
             channel_gauge.add(1, &[KeyValue::new("queue_name", "enrichment")]);
-            let data = post_process(cri_socket_path.clone(), proc_path.clone(), event).await;
-            let Ok(process) = data else {
-                // we can pick up node processes which don't have container names
-                // it is better to ignore and continue processing
-                continue;
+            let data = post_process(event, &pod_api).await;
+            let process = match data {
+                Ok(d) => d,
+                Err(e) => {
+                    event!(Level::ERROR, "could not process event {e}");
+                    continue;
+                }
             };
             counter.add(
                 process.raw_event.packet_length.into(),
@@ -235,7 +162,7 @@ fn tokio_stuff(
         }
     });
 
-    let server_handle = runtime.spawn(async {
+    let server_handle = task::spawn(async {
         let metrics = Router::new().route(
             "/metrics",
             get(|| async move {
@@ -250,7 +177,10 @@ fn tokio_stuff(
         axum::serve(listener, metrics).await.unwrap();
     });
 
-    runtime.block_on(server_handle).unwrap();
+    match try_join!(enrichment_handle, server_handle) {
+        Ok(_) => event!(Level::ERROR, "should not have returned"),
+        Err(err) => event!(Level::ERROR, "async failure {err}"),
+    }
 }
 
 fn main() {
@@ -289,10 +219,18 @@ fn main() {
         .expect("skeleton should open since the bpf program should have compiled sucessfully");
     let mut skeleton_maps = skeleton.maps_mut();
 
+    let Ok(raw_ip) = env::var("POD_IP") else {
+        panic!("POD_IP is not set");
+    };
+
+    let Ok(own_ip) = raw_ip.parse() else {
+        panic!("could not parse {raw_ip} into an IpAddr");
+    };
+
     ring_buffer_builder
         .add(
             skeleton_maps.rb(),
-            callback(sender, capacity_counter.clone()),
+            callback(sender, capacity_counter.clone(), opts.cluster_cidr, own_ip),
         )
         .expect("should be able to open ringbuffer with appropriate permissions");
     let ring_buffer = ring_buffer_builder
@@ -333,13 +271,12 @@ fn main() {
     thread::Builder::new()
         .name("async-tasks".to_string())
         .spawn(move || {
-            tokio_stuff(
-                opts.cri_socket.clone(),
-                opts.proc_fs_path.clone(),
-                receiver,
-                registry,
-                capacity_counter,
-            )
+            runtime::Builder::new_multi_thread()
+                .enable_all()
+                .thread_name("network-probe-workers")
+                .build()
+                .unwrap()
+                .block_on(async { setup_tasks(receiver, registry, capacity_counter).await })
         })
         .unwrap();
 

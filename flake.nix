@@ -15,15 +15,24 @@
       let
         overlays = [ (import rust-overlay) ];
         pkgs = import nixpkgs { inherit system overlays; };
-        libs = with pkgs; [ zstd elfutils libbpf bpftools zlib glibc ];
+        libs = with pkgs; [
+          zstd
+          elfutils
+          libbpf
+          bpftools
+          zlib
+          glibc
+          cargo-udeps
+        ];
+        rustTarget =
+          pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default);
       in {
         devShells.default = with pkgs;
           mkShell {
             nativeBuildInputs = [ pkg-config elfutils ];
             # stack protection nor zerocallusedregs support bpf targets 
             hardeningDisable = [ "stackprotector" "zerocallusedregs" ];
-            buildInputs =
-              [ clang openssl elfutils rust-bin.stable.latest.default ] ++ libs;
+            buildInputs = [ clang openssl elfutils rustTarget ] ++ libs;
 
           };
       });
