@@ -4,13 +4,9 @@ eBPF probe to measure egress traffic by certain cgroups.
 
 ## TODO list for features
 
-- real logging
 - reduce clones
-- reduce instantiating cri clients and regex on each post-processing invocation
 - documented required c libraries
-- prometheus support
 - determine the destination of the outgoing packets
-- interface for pod metadata via CRI or kubernetes api
 - proper error handling
 - break out common functions into their own crates
   - pid to container lib
