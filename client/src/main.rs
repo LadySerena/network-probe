@@ -25,9 +25,9 @@ async fn health_check() -> &'static str {
 
 #[tokio::main]
 async fn main() {
-    // tokio::spawn(async move {
-    //     app().await;
-    // });
+    tokio::spawn(async move {
+        app().await;
+    });
     tokio::spawn(async move {
         let router = Router::new().route("/livez", get(health_check));
         let listener = tokio::net::TcpListener::bind("0.0.0.0:3000").await.unwrap();
