@@ -25,7 +25,7 @@
           cargo-udeps
         ];
         rustTarget =
-          pkgs.rust-bin.selectLatestNightlyWith (toolchain: toolchain.default);
+          pkgs.rust-bin.fromRustupToolchainFile ./rust-toolchain.toml;
       in {
         devShells.default = with pkgs;
           mkShell {
