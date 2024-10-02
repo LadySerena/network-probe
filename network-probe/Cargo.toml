@@ -27,6 +27,7 @@ prometheus = "0.13.4"
 kube = { version = "0.95.0", features = ["runtime", "derive"] }
 k8s-openapi = { version = "0.23.0", features = ["latest"] }
 ipnet = "2.10.0"
+futures = "0.3.30"
 
 [build-dependencies]
 libbpf-cargo = "0.23.3"
