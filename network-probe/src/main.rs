@@ -72,13 +72,14 @@ struct EnrichedData {
     local_ipv4: Ipv4Addr,
     remote_ipv4: Ipv4Addr,
     raw_event: bpf_event,
-    workload_meta: WorkloadMeta
+    workload_meta: WorkloadMeta,
 }
 
 async fn post_process(
     event: bpf_event,
     pod_api: &Api<k8s_openapi::api::core::v1::Pod>,
 ) -> Result<EnrichedData> {
+    let default = &"unknown".to_string();
     let local_ipv4 = Ipv4Addr::from(event.local_ip4);
     let params = ListParams::default()
         .fields(format!("status.podIP={local_ipv4}").as_str())
@@ -89,15 +90,24 @@ async fn post_process(
             "could not find pod for ip {local_ipv4}"
         )));
     };
-    let pod_name = pod.name_any();
     let namespace = pod.namespace().unwrap_or("unknown".to_string());
     let remote_ipv4 = Ipv4Addr::from(event.remote_ip4);
+    let labels = pod.labels();
+    let product = labels.get("product").unwrap_or(default);
+    let project = labels.get("project").unwrap_or(default);
+    let team = labels.get("team").unwrap_or(default);
+    let role = labels.get("role").unwrap_or(default);
     Ok(EnrichedData {
-        pod_name: pod_name.to_string(),
         pod_namespace: namespace.to_string(),
         local_ipv4,
         remote_ipv4,
         raw_event: event,
+        workload_meta: WorkloadMeta {
+            role: role.clone(),
+            project: project.clone(),
+            product: product.clone(),
+            team: team.clone(),
+        },
     })
 }
 
