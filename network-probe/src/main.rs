@@ -60,12 +60,19 @@ struct Cli {
     cluster_cidr: ipnet::IpNet,
 }
 
+struct WorkloadMeta {
+    role: String,
+    project: String,
+    product: String,
+    team: String,
+}
+
 struct EnrichedData {
-    pod_name: String,
     pod_namespace: String,
     local_ipv4: Ipv4Addr,
     remote_ipv4: Ipv4Addr,
     raw_event: bpf_event,
+    workload_meta: WorkloadMeta
 }
 
 async fn post_process(
@@ -153,10 +160,11 @@ async fn setup_tasks(
             counter.add(
                 process.raw_event.packet_length.into(),
                 &[
-                    KeyValue::new("pod_name", process.pod_name),
+                    KeyValue::new("product", process.workload_meta.role),
+                    KeyValue::new("project", process.workload_meta.project),
+                    KeyValue::new("project", process.workload_meta.team),
+                    KeyValue::new("project", process.workload_meta.product),
                     KeyValue::new("pod_namespace", process.pod_namespace),
-                    KeyValue::new("remote_ip", process.remote_ipv4.to_string()),
-                    KeyValue::new("local_ip", process.local_ipv4.to_string()),
                 ],
             );
         }
