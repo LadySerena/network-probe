@@ -63,8 +63,6 @@ unsafe impl Plain for egress_types::bpf_event {}
 struct Cli {
     #[arg(short = 'g', long)]
     cgroup_path: PathBuf,
-    #[arg(short = 'p', long)]
-    proc_fs_path: PathBuf,
     // TODO separate args for pod and service cidr
     #[arg(short = 'a', long)]
     cluster_cidr: ipnet::IpNet,
@@ -211,6 +209,7 @@ async fn setup_tasks(
     prom_registry: Registry,
     channel_gauge: UpDownCounter<i64>,
 ) {
+    event!(Level::INFO, "begin async init");
     let meter = global::meter("network-probe");
     let counter = meter
         .u64_counter("pod.network.egress")
@@ -249,8 +248,11 @@ async fn setup_tasks(
         service_watch.await;
     });
 
+    event!(Level::INFO, "end async init");
+
     // handles getting the pod name from the raw bpf event
     let enrichment_handle = task::spawn(async move {
+        event!(Level::INFO, "begin polling channel");
         while let Some(event) = channel.recv().await {
             channel_gauge.add(1, &[KeyValue::new("queue_name", "enrichment")]);
             let process = match annotate_event(event, &pod_reader, &service_reader) {
@@ -303,7 +305,9 @@ async fn setup_tasks(
 
 fn main() {
     let opts = Cli::parse();
+    event!(Level::INFO, "parsed cli options");
     bump_memlock_rlimit();
+    event!(Level::INFO, "bumped rlimit");
     setup_tracing();
 
     let registry = prometheus::Registry::new();
@@ -311,6 +315,8 @@ fn main() {
         .with_registry(registry.clone())
         .build()
         .unwrap();
+
+    event!(Level::INFO, "set up telemetry");
 
     let provider = SdkMeterProvider::builder().with_reader(exporter).build();
     let meter = provider.meter("network-probe");
@@ -344,6 +350,8 @@ fn main() {
     let Ok(own_ip) = raw_ip.parse() else {
         panic!("could not parse {raw_ip} into an IpAddr");
     };
+
+    event!(Level::INFO, "program loaded");
 
     ring_buffer_builder
         .add(
@@ -385,6 +393,8 @@ fn main() {
             }
         }
     };
+
+    event!(Level::INFO, "listening on cgroup");
 
     // make async run on it's own thread(s)
     thread::Builder::new()
